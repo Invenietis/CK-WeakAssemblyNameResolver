@@ -128,7 +128,7 @@ namespace CK.Core
         {
             var wanted = new AssemblyName( args.Name );
             // Skips unversionned request and satellite assemblies.
-            if( wanted.Version == null || string.IsNullOrWhiteSpace( wanted.CultureName ) ) return null;
+            if( wanted.Version == null || !string.IsNullOrWhiteSpace( wanted.CultureName ) ) return null;
             var resolved = Assembly.Load( new AssemblyName( wanted.Name ) );
             lock( _list )
             {
