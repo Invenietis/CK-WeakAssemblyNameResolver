@@ -90,11 +90,13 @@ namespace CK.Core
         public class TemporaryInstaller : IDisposable
         {
             readonly int _conlictsCount;
+            readonly Action<IReadOnlyList<AssemblyLoadConflict>> _finalConflictsAction;
             AssemblyLoadConflict[] _finalConflicts;
 
-            internal TemporaryInstaller()
+            internal TemporaryInstaller( Action<IReadOnlyList<AssemblyLoadConflict>> finalConflicts )
             {
                 _conlictsCount = Install();
+                _finalConflictsAction = finalConflicts;
             }
 
             /// <summary>
@@ -114,6 +116,7 @@ namespace CK.Core
                 if( _finalConflicts == null )
                 {
                     _finalConflicts = Uninstall( _conlictsCount );
+                    _finalConflictsAction?.Invoke( _finalConflicts );
                 }
             }
         }
@@ -121,8 +124,12 @@ namespace CK.Core
         /// <summary>
         /// Temporary installs the hook that will be uninstalled when the returned object will be disposed.
         /// </summary>
+        /// <param name="finalConflicts">Optional action that will receive the final conflicts list on disposal.</param>
         /// <returns>The <see cref="TemporaryInstaller"/> to dispose when done.</returns>
-        public static TemporaryInstaller TemporaryInstall() => new TemporaryInstaller();
+        public static TemporaryInstaller TemporaryInstall( Action<IReadOnlyList<AssemblyLoadConflict>> finalConflicts = null )
+        {
+            return new TemporaryInstaller( finalConflicts );
+        }
 
         static Assembly CurrentDomain_AssemblyResolve( object sender, ResolveEventArgs args )
         {
