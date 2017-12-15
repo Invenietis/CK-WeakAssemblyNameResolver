@@ -9,8 +9,15 @@ namespace CK.Core
     /// <summary>
     /// Assemby loader helper: hooks the <see cref="AppDomain.AssemblyResolve"/> event
     /// in order to try to load the assembly by name only (no version and public key token).
-    /// The <see cref="GetAssemblyConflicts"/> is maintained and can be used to diagnose any assembly binding issues.
     /// All members are thread safe.
+    /// <para>
+    /// The <see cref="GetAssemblyConflicts"/> is maintained and can be used to diagnose any assembly binding issues.
+    /// </para>
+    /// This can not be "scoped" because the AssemblyResolve event is global and multiple threads may
+    /// concurrently install the hook. This is why the conflicts are in a global list and not in a nice tree
+    /// of lists.
+    /// <para>
+    /// </para>
     /// </summary>
     public static class WeakAssemblyNameResolver
     {
