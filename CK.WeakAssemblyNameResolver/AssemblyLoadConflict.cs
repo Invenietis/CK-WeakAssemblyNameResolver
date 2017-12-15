@@ -17,7 +17,8 @@ namespace CK.Core
         /// <param name="requesting">The requesting assembly name. Can be null.</param>
         /// <param name="wanted">The wanted assembly name. Can not be null.</param>
         /// <param name="resolved">The resolved assembly name. Can be be null.</param>
-        public AssemblyLoadConflict( DateTime t, AssemblyName requesting, AssemblyName wanted, AssemblyName resolved )
+        /// <param name="installCount">Current number of installed hook.</param>
+        public AssemblyLoadConflict( DateTime t, AssemblyName requesting, AssemblyName wanted, AssemblyName resolved, int installCount )
         {
             if( t.Kind != DateTimeKind.Utc ) throw new ArgumentException();
             if( wanted == null ) throw new ArgumentNullException( nameof( wanted ) );
@@ -25,7 +26,18 @@ namespace CK.Core
             Requesting = requesting;
             Wanted = wanted;
             Resolved = resolved;
+            InstallCount = installCount;
         }
+
+        /// <summary>
+        /// Gets the number of active <see cref="WeakAssemblyNameResolver.Install"/> at the time when this
+        /// conflict was captured.
+        /// This should be used with care since in multi-threading environment Install/Uninstall are
+        /// not "embedded" into each other.
+        /// You should use this (to avoid reporting the same conflict more than once for instance) only
+        /// when no parrallel activities can interfere and you have full control of the Install/Unistall scoping.
+        /// </summary>
+        public int InstallCount { get; }
 
         /// <summary>
         /// Gets the date and time in UTC of the conflict.

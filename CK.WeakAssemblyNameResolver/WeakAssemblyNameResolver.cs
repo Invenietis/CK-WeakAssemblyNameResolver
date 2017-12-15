@@ -139,7 +139,7 @@ namespace CK.Core
             var resolved = Assembly.Load( new AssemblyName( wanted.Name ) );
             lock( _list )
             {
-                _list.Add( new AssemblyLoadConflict( DateTime.UtcNow, args.RequestingAssembly?.GetName(), wanted, resolved?.GetName() ) );
+                _list.Add( new AssemblyLoadConflict( DateTime.UtcNow, args.RequestingAssembly?.GetName(), wanted, resolved?.GetName(), _installCount ) );
             }
             return resolved;
         }
