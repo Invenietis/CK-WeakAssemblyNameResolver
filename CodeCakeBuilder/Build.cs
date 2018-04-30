@@ -76,6 +76,12 @@ namespace CodeCake
                     StandardSolutionBuild( solutionFileName, gitInfo, globalInfo.BuildConfiguration );
                 } );
 
+            Task( "Unit-Testing" )
+                .IsDependentOn( "Build" )
+                .Does( () =>
+                {
+                } );
+
             Task( "Create-NuGet-Packages" )
                 .WithCriteria( () => gitInfo.IsValid )
                 .IsDependentOn( "Build" )
