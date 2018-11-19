@@ -275,6 +275,12 @@ namespace CodeCake
                 }
 
                 /// <summary>
+                /// Must provide the secret key name that must be found in the environment variables.
+                /// Without it push is skipped.
+                /// </summary>
+                public abstract string SecretKeyName { get; }
+
+                /// <summary>
                 /// The url of the source. Can be a local path.
                 /// </summary>
                 public string Url => _packageSource.Source;
@@ -432,7 +438,7 @@ namespace CodeCake
         }
 
         /// <summary>
-        /// A VSTS feed uses "VSTS" for the API key.
+        /// A basic VSTS feed uses "VSTS" for the API key and does not handle views.
         /// The https://github.com/Microsoft/artifacts-credprovider must be installed.
         /// </summary>
         class VSTSFeed : NuGetHelper.Feed
@@ -448,6 +454,13 @@ namespace CodeCake
             }
 
             /// <summary>
+            /// The secret key name is null: as long as we don't need to call the Azure DevOps API to
+            /// promote packages, this is not required, the  https://github.com/Microsoft/artifacts-credprovider
+            /// VSS_NUGET_EXTERNAL_FEED_ENDPOINTS must allow pushes to this feed.
+            /// </summary>
+            public override string SecretKeyName => null;
+
+            /// <summary>
             /// Always "VSTS".
             /// </summary>
             /// <param name="ctx">The Cake context.</param>
@@ -458,9 +471,9 @@ namespace CodeCake
         /// <summary>
         /// A SignatureVSTSFeed handles Stable, Latest, Preview and CI Azure feed views with
         /// package promotion based on the published version.
-        /// To handle package promotion, a Personal Access Token, "AZURE_FEED_PAT" environment variable
+        /// To handle package promotion, a Personal Access Token, <see cref="SecretKeyName"/> environment variable
         /// must be defined and contains the token.
-        /// If this "AZURE_FEED_PAT" is not defined or empty, push is skipped.
+        /// If this SecretKeyName is not defined or empty, push is skipped.
         /// </summary>
         class SignatureVSTSFeed : VSTSFeed
         {
@@ -491,23 +504,34 @@ namespace CodeCake
             public string FeedName { get; }
 
             /// <summary>
-            /// Gets the Azure Feed Personal Access Token obtained from the "AZURE_FEED_PAT" environment variable.
+            /// Gets the Azure Feed Personal Access Token obtained from the <see cref="SecretKeyName"/> environment variable.
             /// When null, push is disabled.
             /// </summary>
             protected string AzureFeedPersonalAccessToken => _azureFeedPAT;
 
             /// <summary>
-            /// Looks up for the "AZURE_FEED_PAT" environment variable that is required to promote packages.
+            /// The secret key name is:
+            /// "AZURE_FEED_" + Organization.ToUpperInvariant().Replace( '-', '_' ).Replace( ' ', '_' ) + "_PAT".
+            /// </summary>
+            public override string SecretKeyName => "AZURE_FEED_"
+                                                    + Organization
+                                                            .ToUpperInvariant()
+                                                            .Replace( '-', '_' )
+                                                            .Replace( ' ', '_' )
+                                                    + "_PAT";
+
+            /// <summary>
+            /// Looks up for the <see cref="SecretKeyName"/> environment variable that is required to promote packages.
             /// If this variable is empty or not defined, push is skipped.
             /// </summary>
             /// <param name="ctx">The Cake context.</param>
             /// <returns>The "VSTS" API key or null to skip the push.</returns>
             protected override string ResolveAPIKey( ICakeContext ctx )
             {
-                _azureFeedPAT = ctx.InteractiveEnvironmentVariable( "AZURE_FEED_PAT" );
+                _azureFeedPAT = ctx.InteractiveEnvironmentVariable( SecretKeyName );
                 if( String.IsNullOrWhiteSpace( _azureFeedPAT ) )
                 {
-                    ctx.Warning( "No AZURE_FEED_PAT environment variable found." );
+                    ctx.Warning( $"No {SecretKeyName} environment variable found." );
                     _azureFeedPAT = null;
                 }
                 // The API key for the Credential Provider must be "VSTS".
@@ -596,16 +620,18 @@ namespace CodeCake
             /// </summary>
             /// <param name="name">Name of the feed.</param>
             /// <param name="urlV3">Must be a v3/index.json url otherwise an argument exception is thrown.</param>
-            public RemoteFeed( string name, string urlV3 )
+            /// <param name="secretKeyName">The secret key name.</param>
+            public RemoteFeed( string name, string urlV3, string secretKeyName )
                 : base( name, urlV3 )
             {
+                SecretKeyName = secretKeyName;
             }
 
             /// <summary>
             /// Gets or sets the push API key name.
             /// This is the environment variable name that must contain the NuGet API key required to push.
             /// </summary>
-            public string APIKeyName { get; set; }
+            public override string SecretKeyName { get; }
 
             /// <summary>
             /// Resolves the API key from <see cref="APIKeyName"/> environment variable.
@@ -614,12 +640,12 @@ namespace CodeCake
             /// <returns>The API key or null.</returns>
             protected override string ResolveAPIKey( ICakeContext ctx )
             {
-                if( String.IsNullOrEmpty( APIKeyName ) )
+                if( String.IsNullOrEmpty( SecretKeyName ) )
                 {
                     ctx.Information( $"Remote feed '{Name}' APIKeyName is null or empty." );
                     return null;
                 }
-                return ctx.InteractiveEnvironmentVariable( APIKeyName );
+                return ctx.InteractiveEnvironmentVariable( SecretKeyName );
             }
 
         }
@@ -633,6 +659,8 @@ namespace CodeCake
                 : base( path )
             {
             }
+
+            public override string SecretKeyName => null;
 
             protected override string ResolveAPIKey( ICakeContext ctx ) => null;
         }
