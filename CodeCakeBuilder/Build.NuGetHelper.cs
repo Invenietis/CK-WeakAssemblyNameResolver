@@ -24,7 +24,7 @@ namespace CodeCake
     public partial class Build
     {
         /// <summary>
-        /// Package with both PackageIdentity from NuGet) and SVersion (from CSemVer).
+        /// Package with both PackageIdentity (from NuGet) and SVersion (from CSemVer).
         /// </summary>
         struct SimplePackageId
         {
@@ -58,6 +58,7 @@ namespace CodeCake
             static readonly List<Lazy<INuGetResourceProvider>> _providers;
             static readonly ISettings _settings;
             static readonly PackageProviderProxy _sourceProvider;
+            static readonly List<VSTSFeed> _vstsFeeds;
             static ILogger _logger;
 
             /// <summary>
@@ -143,18 +144,9 @@ namespace CodeCake
 
             static NuGetHelper()
             {
-                // Workaround for dev/NuGet.Client\src\NuGet.Core\NuGet.Protocol\Plugins\PluginFactory.cs line 161:
-                // FileName = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH"),
-                // This line should be:
-                // FileName = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet",
-                //
-                // Issue: https://github.com/NuGet/Home/issues/7438
-                //
-                Environment.SetEnvironmentVariable( "DOTNET_HOST_PATH", "dotnet" );
-
                 _settings = Settings.LoadDefaultSettings( Environment.CurrentDirectory );
                 _sourceProvider = new PackageProviderProxy( _settings );
-
+                _vstsFeeds = new List<VSTSFeed>();
                 _sourceCache = new SourceCacheContext();
                 _providers = new List<Lazy<INuGetResourceProvider>>();
                 _providers.AddRange( Repository.Provider.GetCoreV3() );
@@ -208,6 +200,7 @@ namespace CodeCake
                     {
                         ctx.Information( $"{s.Name} => {s.Source}" );
                     }
+                    InitializeVSTSEnvironment( ctx );
                     _logger = new Logger( ctx );
                     var credProviders = new AsyncLazy<IEnumerable<ICredentialProvider>>( async () => await GetCredentialProvidersAsync( _sourceProvider, _logger ) );
                     HttpHandlerResourceV3.CredentialService = new Lazy<ICredentialService>(
@@ -218,6 +211,38 @@ namespace CodeCake
                 }
                 return _logger;
             }
+
+            static void InitializeVSTSEnvironment( ICakeContext ctx )
+            {
+                // Workaround for dev/NuGet.Client\src\NuGet.Core\NuGet.Protocol\Plugins\PluginFactory.cs line 161:
+                // FileName = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH"),
+                // This line should be:
+                // FileName = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet",
+                //
+                // Issue: https://github.com/NuGet/Home/issues/7438
+                //
+                Environment.SetEnvironmentVariable( "DOTNET_HOST_PATH", "dotnet" );
+
+                // The VSS_NUGET_EXTERNAL_FEED_ENDPOINTS is used by Azure Credential Provider to handle authentication
+                // for the feed.
+                int count = 0;
+                StringBuilder b = new StringBuilder( @"{""endpointCredentials"":[" );
+                foreach( var f in _vstsFeeds )
+                {
+                    var azureFeedPAT = ctx.InteractiveEnvironmentVariable( f.SecretKeyName );
+                    if( !String.IsNullOrEmpty( azureFeedPAT ) )
+                    {
+                        ++count;
+                        b.Append( @"{""endpoint"":""" ).AppendJSONEscaped( f.Url ).Append( @"""," )
+                         .Append( @"""username"":""Unused"",""password"":""" ).AppendJSONEscaped( azureFeedPAT ).Append( @"""" )
+                         .Append( "}" );
+                    }
+                }
+                b.Append( "]}" );
+                ctx.Information( $"Created {count} feed end point(s) in VSS_NUGET_EXTERNAL_FEED_ENDPOINTS." );
+                Environment.SetEnvironmentVariable( "VSS_NUGET_EXTERNAL_FEED_ENDPOINTS", b.ToString() );
+            }
+
             static async Task<IEnumerable<ICredentialProvider>> GetCredentialProvidersAsync( IPackageSourceProvider sourceProvider, ILogger logger )
             {
                 var providers = new List<ICredentialProvider>();
@@ -247,6 +272,7 @@ namespace CodeCake
                 protected Feed( string name, string urlV3 )
                     : this( _sourceProvider.FindOrCreateFromUrl( name, urlV3 ) )
                 {
+                    if( this is VSTSFeed f ) _vstsFeeds.Add( f );
                 }
 
                 /// <summary>
@@ -440,85 +466,33 @@ namespace CodeCake
         /// <summary>
         /// A basic VSTS feed uses "VSTS" for the API key and does not handle views.
         /// The https://github.com/Microsoft/artifacts-credprovider must be installed.
+        /// A Personal Access Token, <see cref="SecretKeyName"/> environment variable
+        /// must be defined and contains the token.
+        /// If this SecretKeyName is not defined or empty, push is skipped.
         /// </summary>
         class VSTSFeed : NuGetHelper.Feed
         {
+            string _azureFeedPAT;
+
             /// <summary>
             /// Initialize a new remote VSTS feed.
             /// </summary>
             /// <param name="name">Name of the feed.</param>
             /// <param name="urlV3">Must be a v3/index.json url otherwise an argument exception is thrown.</param>
-            public VSTSFeed( string name, string urlV3 )
+            /// <param name="secretKeyName">The secret key name. When null or empty, push is skipped.</param>
+            public VSTSFeed( string name, string urlV3, string secretKeyName )
                 : base( name, urlV3 )
             {
+                SecretKeyName = secretKeyName;
             }
 
             /// <summary>
-            /// The secret key name is null: as long as we don't need to call the Azure DevOps API to
-            /// promote packages, this is not required, the  https://github.com/Microsoft/artifacts-credprovider
-            /// VSS_NUGET_EXTERNAL_FEED_ENDPOINTS must allow pushes to this feed.
+            /// Gets the name of the environment variable that must contain the
+            /// Personal Access Token that allows push to this feed.
+            /// The  https://github.com/Microsoft/artifacts-credprovider VSS_NUGET_EXTERNAL_FEED_ENDPOINTS
+            /// will be dynalically generated.
             /// </summary>
-            public override string SecretKeyName => null;
-
-            /// <summary>
-            /// Always "VSTS".
-            /// </summary>
-            /// <param name="ctx">The Cake context.</param>
-            /// <returns>The "VSTS" key.</returns>
-            protected override string ResolveAPIKey( ICakeContext ctx ) => "VSTS";
-        }
-
-        /// <summary>
-        /// A SignatureVSTSFeed handles Stable, Latest, Preview and CI Azure feed views with
-        /// package promotion based on the published version.
-        /// To handle package promotion, a Personal Access Token, <see cref="SecretKeyName"/> environment variable
-        /// must be defined and contains the token.
-        /// If this SecretKeyName is not defined or empty, push is skipped.
-        /// </summary>
-        class SignatureVSTSFeed : VSTSFeed
-        {
-            string _azureFeedPAT;
-
-            /// <summary>
-            /// Initialize a new SignatureVSTSFeed.
-            /// Its <see cref="NuGetHelper.Feed.Name"/> is set to "<paramref name="organization"/>-<paramref name="feedName"/>"
-            /// (and may be prefixed with "CCB-" if it doesn't correspond to a source defined in the NuGet.config settings.
-            /// </summary>
-            /// <param name="organization">Name of the organization.</param>
-            /// <param name="feedName">Identifier of the feed in Azure, inside the organization.</param>
-            public SignatureVSTSFeed( string organization = "Signature-OpenSource", string feedName = "Default" )
-                : base( organization+"-"+feedName, $"https://pkgs.dev.azure.com/{organization}/_packaging/{feedName}/nuget/v3/index.json" )
-            {
-                Organization = organization;
-                FeedName = feedName;
-            }
-
-            /// <summary>
-            /// Gets the organization name.
-            /// </summary>
-            public string Organization { get; }
-
-            /// <summary>
-            /// Gets the feed identifier.
-            /// </summary>
-            public string FeedName { get; }
-
-            /// <summary>
-            /// Gets the Azure Feed Personal Access Token obtained from the <see cref="SecretKeyName"/> environment variable.
-            /// When null, push is disabled.
-            /// </summary>
-            protected string AzureFeedPersonalAccessToken => _azureFeedPAT;
-
-            /// <summary>
-            /// The secret key name is:
-            /// "AZURE_FEED_" + Organization.ToUpperInvariant().Replace( '-', '_' ).Replace( ' ', '_' ) + "_PAT".
-            /// </summary>
-            public override string SecretKeyName => "AZURE_FEED_"
-                                                    + Organization
-                                                            .ToUpperInvariant()
-                                                            .Replace( '-', '_' )
-                                                            .Replace( ' ', '_' )
-                                                    + "_PAT";
+            public override string SecretKeyName { get; }
 
             /// <summary>
             /// Looks up for the <see cref="SecretKeyName"/> environment variable that is required to promote packages.
@@ -538,6 +512,47 @@ namespace CodeCake
                 return _azureFeedPAT != null ? "VSTS" : null;
             }
 
+        }
+
+        /// <summary>
+        /// A SignatureVSTSFeed handles Stable, Latest, Preview and CI Azure feed views with
+        /// package promotion based on the published version.
+        /// The secret key name is:
+        /// "AZURE_FEED_" + Organization.ToUpperInvariant().Replace( '-', '_' ).Replace( ' ', '_' ) + "_PAT".
+        /// </summary>
+        class SignatureVSTSFeed : VSTSFeed
+        {
+            /// <summary>
+            /// Initialize a new SignatureVSTSFeed.
+            /// Its <see cref="NuGetHelper.Feed.Name"/> is set to "<paramref name="organization"/>-<paramref name="feedName"/>"
+            /// (and may be prefixed with "CCB-" if it doesn't correspond to a source defined in the NuGet.config settings.
+            /// </summary>
+            /// <param name="organization">Name of the organization.</param>
+            /// <param name="feedName">Identifier of the feed in Azure, inside the organization.</param>
+            public SignatureVSTSFeed( string organization, string feedName )
+                : base( organization + "-" + feedName,
+                        $"https://pkgs.dev.azure.com/{organization}/_packaging/{feedName}/nuget/v3/index.json",
+                        "AZURE_FEED_" + organization
+                                        .ToUpperInvariant()
+                                        .Replace( '-', '_' )
+                                        .Replace( ' ', '_' )
+                                        + "_PAT" )
+            {
+                Organization = organization;
+                FeedName = feedName;
+            }
+
+            /// <summary>
+            /// Gets the organization name.
+            /// </summary>
+            public string Organization { get; }
+
+            /// <summary>
+            /// Gets the feed identifier.
+            /// </summary>
+            public string FeedName { get; }
+
+
             /// <summary>
             /// Implements Package promotion in @CI, @Preview, @Latest and @Stable views.
             /// </summary>
@@ -547,6 +562,7 @@ namespace CodeCake
             /// <returns>The awaitable.</returns>
             protected override async Task OnAllPackagesPushed( ICakeContext ctx, string path, IEnumerable<SimplePackageId> packages )
             {
+                var basicAuth = Convert.ToBase64String( ASCIIEncoding.ASCII.GetBytes( ":" + ctx.InteractiveEnvironmentVariable( SecretKeyName ) ) );
                 foreach( var p in packages )
                 {
                     foreach( var view in GetViewNames( p.Version ) )
@@ -554,7 +570,6 @@ namespace CodeCake
                         using( HttpRequestMessage req = new HttpRequestMessage( HttpMethod.Post, $"https://pkgs.dev.azure.com/{Organization}/_apis/packaging/feeds/{FeedName}/nuget/packagesBatch?api-version=5.0-preview.1" ) )
                         {
 
-                            var basicAuth = Convert.ToBase64String( ASCIIEncoding.ASCII.GetBytes( ":" + AzureFeedPersonalAccessToken ) );
                             req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue( "Basic", basicAuth );
                             var body = GetPromotionJSONBody( p.PackageId, p.PackageIdentity.Version.ToString(), view );
                             req.Content = new StringContent( body, Encoding.UTF8, "application/json" );
@@ -564,7 +579,7 @@ namespace CodeCake
                                 {
                                     ctx.Information( $"Package '{p}' promoted to view '@{view}'." );
                                 }
-                                else 
+                                else
                                 {
                                     ctx.Error( $"Package '{p}' promotion to view '@{view}' failed." );
                                     m.EnsureSuccessStatusCode();
@@ -609,7 +624,7 @@ namespace CodeCake
         }
 
         /// <summary>
-        /// A remote feed where push is controlled by its <see cref="APIKeyName"/>.
+        /// A remote feed where push is controlled by its <see cref="SecretKeyName"/>.
         /// </summary>
         class RemoteFeed : NuGetHelper.Feed
         {
@@ -664,7 +679,6 @@ namespace CodeCake
 
             protected override string ResolveAPIKey( ICakeContext ctx ) => null;
         }
-
 
     }
 }
