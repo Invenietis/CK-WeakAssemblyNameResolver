@@ -14,6 +14,7 @@ using NuGet.Versioning;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Threading;
@@ -33,13 +34,6 @@ namespace CodeCake
             static ILogger _logger;
 
             /// <summary>
-            /// Shared http client.
-            /// See: https://aspnetmonsters.com/2016/08/2016-08-27-httpclientwrong/
-            /// Do not add any default on it.
-            /// </summary>
-            public static readonly HttpClient SharedHttpClient;
-
-            /// <summary>
             /// Implements a IPackageSourceProvider that mixes sources from NuGet.config settings
             /// and sources that are used by the build chain.
             /// </summary>
@@ -57,7 +51,7 @@ namespace CodeCake
 
                 public PackageSource FindOrCreateFromUrl( string name, string urlV3 )
                 {
-                    if( string.IsNullOrEmpty( urlV3 ) || !urlV3.EndsWith( "/v3/index.json" ) )
+                    if( string.IsNullOrEmpty( urlV3 ) || (!new Uri( urlV3 ).IsFile && !urlV3.EndsWith( "/v3/index.json" )) )
                     {
                         throw new ArgumentException( "Feed requires a /v3/index.json url.", nameof( urlV3 ) );
                     }
@@ -147,7 +141,6 @@ namespace CodeCake
                 _sourceCache = new SourceCacheContext().WithRefreshCacheTrue();
                 _providers = new List<Lazy<INuGetResourceProvider>>();
                 _providers.AddRange( Repository.Provider.GetCoreV3() );
-                SharedHttpClient = new HttpClient();
             }
 
             class Logger : ILogger
@@ -197,55 +190,41 @@ namespace CodeCake
                     {
                         ctx.Information( $"{s.Name} => {s.Source}" );
                     }
-                    InitializeVSTSEnvironment( ctx );
                     _logger = new Logger( ctx );
-                    var credProviders = new AsyncLazy<IEnumerable<ICredentialProvider>>( async () => await GetCredentialProvidersAsync( _logger ) );
-                    HttpHandlerResourceV3.CredentialService = new Lazy<ICredentialService>(
-                        () => new CredentialService(
-                            providers: credProviders,
-                            nonInteractive: true,
-                            handlesDefaultCredentials: true ) );
+
                 }
                 return _logger;
             }
 
-            static void InitializeVSTSEnvironment( ICakeContext ctx )
+            class Creds : ICredentialProvider
             {
-                // Workaround for dev/NuGet.Client\src\NuGet.Core\NuGet.Protocol\Plugins\PluginFactory.cs line 161:
-                // FileName = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH"),
-                // This line should be:
-                // FileName = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet",
-                //
-                // Issue: https://github.com/NuGet/Home/issues/7438
-                //
-                Environment.SetEnvironmentVariable( "DOTNET_HOST_PATH", "dotnet" );
+                private readonly ICakeContext _ctx;
 
-                // The VSS_NUGET_EXTERNAL_FEED_ENDPOINTS is used by Azure Credential Provider to handle authentication
-                // for the feed.
-                int count = 0;
-                StringBuilder b = new StringBuilder( @"{""endpointCredentials"":[" );
-                foreach( var f in _vstsFeeds )
+                public Creds( ICakeContext ctx )
                 {
-                    var azureFeedPAT = ctx.InteractiveEnvironmentVariable( f.SecretKeyName );
-                    if( !String.IsNullOrEmpty( azureFeedPAT ) )
-                    {
-                        ++count;
-                        b.Append( @"{""endpoint"":""" ).AppendJSONEscaped( f.Url ).Append( @"""," )
-                         .Append( @"""username"":""Unused"",""password"":""" ).AppendJSONEscaped( azureFeedPAT ).Append( @"""" )
-                         .Append( "}" );
-                    }
+                    _ctx = ctx;
                 }
-                b.Append( "]}" );
-                ctx.Information( $"Created {count} feed end point(s) in VSS_NUGET_EXTERNAL_FEED_ENDPOINTS." );
-                Environment.SetEnvironmentVariable( "VSS_NUGET_EXTERNAL_FEED_ENDPOINTS", b.ToString() );
-            }
 
-            static async Task<IEnumerable<ICredentialProvider>> GetCredentialProvidersAsync( ILogger logger )
-            {
-                var providers = new List<ICredentialProvider>();
-                var securePluginProviders = await new SecurePluginCredentialProviderBuilder( pluginManager: PluginManager.Instance, canShowDialog: false, logger: logger ).BuildAllAsync();
-                providers.AddRange( securePluginProviders );
-                return providers;
+                public string Id { get; }
+
+                public Task<CredentialResponse> GetAsync(
+                    Uri uri,
+                    IWebProxy proxy,
+                    CredentialRequestType type,
+                    string message,
+                    bool isRetry,
+                    bool nonInteractive,
+                    CancellationToken cancellationToken ) =>
+                    System.Threading.Tasks.Task.FromResult(
+                        new CredentialResponse(
+                            new NetworkCredential(
+                                "CKli",
+                                _ctx.InteractiveEnvironmentVariable(
+                                    _vstsFeeds.Single( p => new Uri( p.Url ).ToString() == uri.ToString() ).SecretKeyName
+                                )
+                            )
+                        )
+                    );
             }
 
             /// <summary>
@@ -256,7 +235,6 @@ namespace CodeCake
                 readonly PackageSource _packageSource;
                 readonly SourceRepository _sourceRepository;
                 readonly AsyncLazy<PackageUpdateResource> _updater;
-                
                 /// <summary>
                 /// Initialize a new remote feed.
                 /// Its final <see cref="Name"/> is the one of the existing feed if it appears in the existing
@@ -269,7 +247,22 @@ namespace CodeCake
                 protected NuGetFeed( NuGetArtifactType type, string name, string urlV3 )
                     : this( type, _sourceProvider.FindOrCreateFromUrl( name, urlV3 ) )
                 {
-                    if( this is VSTSFeed f ) _vstsFeeds.Add( f );
+                    if( this is VSTSFeed f )
+                    {
+                        if( HttpHandlerResourceV3.CredentialService == null )
+                        {
+                            HttpHandlerResourceV3.CredentialService = new Lazy<ICredentialService>(
+                            () => new CredentialService(
+                                providers: new AsyncLazy<IEnumerable<ICredentialProvider>>(
+                                    () => System.Threading.Tasks.Task.FromResult<IEnumerable<ICredentialProvider>>(
+                                        new List<Creds> { new Creds( Cake ) } )
+                                ),
+                                nonInteractive: true,
+                                handlesDefaultCredentials: true )
+                            );
+                        }
+                        _vstsFeeds.Add( f );
+                    }
                 }
 
                 /// <summary>
@@ -334,7 +327,7 @@ namespace CodeCake
                     MetadataResource meta = await _sourceRepository.GetResourceAsync<MetadataResource>();
                     foreach( var p in artifacts )
                     {
-                        var pId = new PackageIdentity( p.ArtifactInstance.Artifact.Name, new NuGetVersion( p.ArtifactInstance.Version.ToNuGetPackageString() ) );
+                        var pId = new PackageIdentity( p.ArtifactInstance.Artifact.Name, new NuGetVersion( p.ArtifactInstance.Version.ToNormalizedString() ) );
                         if( await meta.Exists( pId, _sourceCache, logger, CancellationToken.None ) )
                         {
                             Cake.Debug( $" ==> Feed '{Name}' already contains {p.ArtifactInstance}." );
@@ -370,7 +363,7 @@ namespace CodeCake
                     var updater = await _updater;
                     foreach( var p in pushes )
                     {
-                        string packageString = p.Name + "." + p.Version.ToNuGetPackageString();
+                        string packageString = p.Name + "." + p.Version.WithBuildMetaData( null ).ToNormalizedString();
                         var fullPath = ArtifactType.GlobalInfo.ReleasesFolder.AppendPart( packageString + ".nupkg" );
                         await updater.Push(
                             fullPath,
@@ -452,7 +445,6 @@ namespace CodeCake
                 // The API key for the Credential Provider must be "VSTS".
                 return _azureFeedPAT != null ? "VSTS" : null;
             }
-
         }
 
         /// <summary>
@@ -482,13 +474,16 @@ namespace CodeCake
             /// </summary>
             /// <param name="organization">Name of the organization.</param>
             /// <param name="feedName">Identifier of the feed in Azure, inside the organization.</param>
-            public SignatureVSTSFeed( NuGetArtifactType t, string organization, string feedName )
+            public SignatureVSTSFeed( NuGetArtifactType t, string organization, string feedName, string projectName )
                 : base( t, organization + "-" + feedName,
-                        $"https://pkgs.dev.azure.com/{organization}/_packaging/{feedName}/nuget/v3/index.json",
+                      projectName != null ?
+                          $"https://pkgs.dev.azure.com/{organization}/{projectName}/_packaging/{feedName}/nuget/v3/index.json"
+                        : $"https://pkgs.dev.azure.com/{organization}/_packaging/{feedName}/nuget/v3/index.json",
                         GetSecretKeyName( organization ) )
             {
                 Organization = organization;
                 FeedName = feedName;
+                ProjectName = projectName;
             }
 
             /// <summary>
@@ -501,11 +496,13 @@ namespace CodeCake
             /// </summary>
             public string FeedName { get; }
 
+            public string ProjectName { get; }
+
             /// <summary>
-            /// Implements Package promotion in @CI, @Preview, @Latest and @Stable views.
+            /// Implements Package promotion in @CI, @Exploratory, @Preview, @Latest and @Stable views.
             /// </summary>
             /// <param name="ctx">The Cake context.</param>
-            /// <param name="path">The path where the .nupkg mus be found.</param>
+            /// <param name="pushes">The set of artifacts to promote.</param>
             /// <returns>The awaitable.</returns>
             protected override async Task OnAllArtifactsPushed( IEnumerable<ArtifactPush> pushes )
             {
@@ -514,12 +511,15 @@ namespace CodeCake
                 {
                     foreach( var view in p.Version.PackageQuality.GetLabels() )
                     {
-                        using( HttpRequestMessage req = new HttpRequestMessage( HttpMethod.Post, $"https://pkgs.dev.azure.com/{Organization}/_apis/packaging/feeds/{FeedName}/nuget/packagesBatch?api-version=5.0-preview.1" ) )
+                        var url = ProjectName != null ?
+                              $"https://pkgs.dev.azure.com/{Organization}/{ProjectName}/_apis/packaging/feeds/{FeedName}/nuget/packagesBatch?api-version=5.0-preview.1"
+                            : $"https://pkgs.dev.azure.com/{Organization}/_apis/packaging/feeds/{FeedName}/nuget/packagesBatch?api-version=5.0-preview.1";
+                        using( HttpRequestMessage req = new HttpRequestMessage( HttpMethod.Post, url ) )
                         {
                             req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue( "Basic", basicAuth );
-                            var body = GetPromotionJSONBody( p.Name, p.Version.ToNuGetPackageString(), view.ToString() );
+                            var body = GetPromotionJSONBody( p.Name, p.Version.ToNormalizedString(), view.ToString() );
                             req.Content = new StringContent( body, Encoding.UTF8, "application/json" );
-                            using( var m = await NuGetHelper.SharedHttpClient.SendAsync( req ) )
+                            using( var m = await StandardGlobalInfo.SharedHttpClient.SendAsync( req ) )
                             {
                                 if( m.IsSuccessStatusCode )
                                 {
@@ -613,7 +613,6 @@ namespace CodeCake
 
             protected override string ResolveAPIKey() => null;
         }
-
     }
 }
 
