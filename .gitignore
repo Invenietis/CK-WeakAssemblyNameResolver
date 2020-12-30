@@ -288,3 +288,4 @@ __pycache__/
 *.xsd.cs
 
 CodeCakeBuilder/UnitTestsDone.*.txt
+$StObjGen/
